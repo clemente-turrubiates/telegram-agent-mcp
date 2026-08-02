@@ -1,0 +1,38 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "telegram-agent-mcp"
+description = "MCP server exposing a Telegram bot so LLM agents can converse, discover each other, and route tasks in a shared group chat"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "clemente-turrubiates" }]
+keywords = ["mcp", "telegram", "llm", "agents", "orchestration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/clemente-turrubiates/telegram-agent-mcp"
+Repository = "https://github.com/clemente-turrubiates/telegram-agent-mcp"
+Issues = "https://github.com/clemente-turrubiates/telegram-agent-mcp/issues"
+
+[tool.maturin]
+# Ship the compiled Rust binary in the wheel and expose it on PATH, rather
+# than building a Python extension module — there is no Python code here.
+bindings = "bin"
+strip = true
+
+[tool.maturin.generate-ci.github]
+# Publish via PyPI trusted publishing (OIDC) instead of a long-lived API
+# token stored in repo secrets.
+trusted-publishing = true
+publishing-environment = "release"

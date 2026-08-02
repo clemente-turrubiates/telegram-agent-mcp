@@ -1,0 +1,52 @@
+[package]
+name = "telegram-agent-mcp"
+version = "0.4.0"
+edition = "2024"
+description = "MCP server exposing a Telegram bot so LLM agents can converse, discover each other, and route tasks in a shared group chat"
+license = "MIT"
+repository = "https://github.com/clemente-turrubiates/telegram-agent-mcp"
+keywords = ["mcp", "telegram", "llm", "agents", "orchestration"]
+categories = ["command-line-utilities", "api-bindings"]
+
+[dependencies]
+anyhow = "1.0.104"
+# rustls with the `ring` crypto provider rather than reqwest's default
+# `aws-lc-rs`: aws-lc-sys needs cmake and a full C toolchain and fails to
+# cross-compile (e.g. aarch64-linux, where its cross-gcc lacks stdatomic.h),
+# which breaks the release wheel builds. `ring` cross-compiles cleanly.
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "json",
+    "charset",
+    "http2",
+    "system-proxy",
+    "rustls-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+# `local` must stay OFF: it compiles out StreamableHttpService, which the
+# hub mode depends on.
+rmcp = { version = "3.0.1", features = [
+    "server",
+    # `client` is needed by the bridge mode, which speaks MCP to a hub.
+    "client",
+    "macros",
+    "schemars",
+    "transport-io",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+] }
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+# Config-file parsing only; no serializer, no preserve_order.
+toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+http = "1.5.0"

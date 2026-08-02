@@ -1,0 +1,13 @@
+/target
+
+# Locally built wheels (`maturin build --out dist`). Release artifacts are
+# built by CI from a tag, not committed.
+/dist
+
+# Per-editor working state, created by whichever assistant is running here.
+/.kilo
+/.qwen
+
+# A bot token used for local testing. Never commit one: it is a full
+# credential for the bot, and Telegram gives no way to scope it down.
+/.env
