@@ -74,10 +74,18 @@ pub fn router(registry: Arc<AgentRegistry>) -> axum::Router {
 /// resulting 404s from a client's MCP handshake say nothing about the cause.
 pub const HEALTH_MARKER: &str = "telegram-agent-mcp";
 
-pub async fn serve(addr: std::net::SocketAddr, registry: Arc<AgentRegistry>) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr)
+/// Claims the port. Separate from [`serve`] so the caller can take the port
+/// before starting anything with side effects outside this process.
+pub async fn bind(addr: std::net::SocketAddr) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr)
         .await
-        .with_context(|| format!("binding {addr}"))?;
+        .with_context(|| format!("binding {addr}"))
+}
+
+pub async fn serve(listener: tokio::net::TcpListener, registry: Arc<AgentRegistry>) -> Result<()> {
+    let addr = listener
+        .local_addr()
+        .context("reading the listener's address")?;
 
     let names = registry.names().join(", ");
     tracing::info!("MCP hub listening on http://{addr}/mcp — agents: [{names}]");

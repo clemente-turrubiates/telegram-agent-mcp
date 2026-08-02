@@ -134,9 +134,15 @@ async fn run_hub(cli: &config::Cli, addr: &str) -> Result<()> {
         hub.use_chat_cache(dir.join("chats.json"));
     }
     let registry = AgentRegistry::build(&config, hub, reqwest::Client::new())?;
+
+    // Bind before polling. Two clients starting at once both find the port
+    // closed and both spawn a hub; the loser must fail on the port, quietly,
+    // rather than first opening a getUpdates connection per token and 409ing
+    // the winner off every one of its bots on the way out.
+    let listener = http::bind(addr).await?;
     registry.spawn_pollers();
 
-    http::serve(addr, registry).await
+    http::serve(listener, registry).await
 }
 
 /// stdio on one side, a hub over HTTP on the other, for MCP clients that can

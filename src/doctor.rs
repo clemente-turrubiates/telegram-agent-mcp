@@ -61,7 +61,13 @@ pub async fn run(cli: &Cli) -> Result<()> {
     println!("\nhub");
     match config::parse_addr(&addr) {
         Ok(sock) => match crate::autostart::probe(&format!("http://{sock}/mcp")).await {
-            Probe::Hub => println!("  ✓ running at {sock} — agents started now will join it"),
+            Probe::Hub { version } if version != env!("CARGO_PKG_VERSION") => println!(
+                "  ! running at {sock}, but on {version} rather than {}. It serves the older                  code until restarted — close every agent, then start one again.",
+                env!("CARGO_PKG_VERSION")
+            ),
+            Probe::Hub { .. } => {
+                println!("  ✓ running at {sock} — agents started now will join it")
+            }
             Probe::Closed => {
                 println!("  · not running; the first agent to start will bring one up")
             }

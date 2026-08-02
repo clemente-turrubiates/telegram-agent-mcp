@@ -59,7 +59,17 @@ pub async fn ensure_hub(cli: &Cli, agent: Option<&str>) -> Result<String> {
     let url = format!("http://{addr}/mcp");
 
     match probe(&url).await {
-        Probe::Hub => {
+        Probe::Hub { version } => {
+            if version != env!("CARGO_PKG_VERSION") {
+                // Upgrading the package does not replace a hub that is
+                // already running, so this is what an upgrade looks like from
+                // the inside: new tools on the client, old behaviour serving
+                // them, and nothing saying why.
+                tracing::warn!(
+                    "the hub at {addr} is running {version} but this is {}. It keeps serving the                      older code until it is restarted — close every agent, then start one again.",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
             tracing::info!("using the hub already running at {addr}");
             return Ok(url);
         }
@@ -81,7 +91,7 @@ pub async fn ensure_hub(cli: &Cli, agent: Option<&str>) -> Result<String> {
 
     let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
-        if matches!(probe(&url).await, Probe::Hub) {
+        if matches!(probe(&url).await, Probe::Hub { .. }) {
             tracing::info!("hub is up at {addr}");
             return Ok(url);
         }
@@ -98,8 +108,8 @@ pub async fn ensure_hub(cli: &Cli, agent: Option<&str>) -> Result<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Probe {
-    /// Our hub, ready to serve.
-    Hub,
+    /// A hub, ready to serve, running the given version.
+    Hub { version: String },
     /// Nothing listening, so the port is ours to take.
     Closed,
     /// Someone else's server. Distinguishing this from `Hub` is the whole
@@ -113,8 +123,11 @@ pub async fn probe(url: &str) -> Probe {
     let resp = tokio::time::timeout(PROBE_TIMEOUT, client.get(&health).send()).await;
     match resp {
         Ok(Ok(r)) => match r.text().await {
-            Ok(body) if body.starts_with(crate::http::HEALTH_MARKER) => Probe::Hub,
-            _ => Probe::Stranger,
+            Ok(body) => match hub_version(&body) {
+                Some(version) => Probe::Hub { version },
+                None => Probe::Stranger,
+            },
+            Err(_) => Probe::Stranger,
         },
         // A connection error is the port being closed; anything slower than
         // the timeout is treated the same way, since a hub answers instantly.
@@ -180,3 +193,40 @@ fn detach(cmd: &mut Command) {
 
 #[cfg(not(any(windows, unix)))]
 fn detach(_cmd: &mut Command) {}
+
+/// Reads the version out of a `/health` body, or `None` if this is not one of
+/// ours. The body is `telegram-agent-mcp <version> agents=[...]`.
+fn hub_version(body: &str) -> Option<String> {
+    let rest = body.strip_prefix(crate::http::HEALTH_MARKER)?;
+    Some(
+        rest.split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_health_body_yields_a_version() {
+        assert_eq!(
+            hub_version(
+                "telegram-agent-mcp 0.4.0 agents=[a, b]
+"
+            )
+            .as_deref(),
+            Some("0.4.0")
+        );
+    }
+
+    #[test]
+    fn anything_else_on_the_port_is_not_a_hub() {
+        // Whatever else answers, it must not be mistaken for one — that is
+        // the entire reason /health exists rather than a bare TCP connect.
+        assert_eq!(hub_version("<!doctype html><title>404</title>"), None);
+        assert_eq!(hub_version(""), None);
+    }
+}
