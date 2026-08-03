@@ -111,13 +111,29 @@ pub async fn serve(listener: tokio::net::TcpListener, registry: Arc<AgentRegistr
 pub async fn bridge_stdio_to(url: &str) -> Result<()> {
     use rmcp::RoleServer;
     use rmcp::transport::async_rw::AsyncRwTransport;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
     use rmcp::transport::{StreamableHttpClientTransport, Transport};
 
     tracing::info!("bridging stdio to {url}");
 
     let mut downstream =
         AsyncRwTransport::<RoleServer, _, _>::new(tokio::io::stdin(), tokio::io::stdout());
-    let mut upstream = StreamableHttpClientTransport::from_uri(url);
+    // rmcp's `from_uri`/`from_config` build a reqwest client with
+    // `pool_max_idle_per_host(0)` (avoiding a Linux Delayed-ACK stall), which
+    // means every call opens a fresh TCP connection that lands in TIME_WAIT.
+    // This bridge lives for one long-running stdio session and makes many
+    // calls against the same hub, so we opt back into keep-alive here — the
+    // Linux quirk the upstream default is dodging doesn't apply to us, and
+    // without pooling a long session exhausts the local ephemeral port range.
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(4)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building the keep-alive HTTP client for the hub bridge")?;
+    let mut upstream = StreamableHttpClientTransport::with_client(
+        client,
+        StreamableHttpClientTransportConfig::with_uri(url),
+    );
 
     // After stdin closes there may still be replies in flight. Keep draining
     // them until the hub goes quiet, rather than dropping the answer to the
