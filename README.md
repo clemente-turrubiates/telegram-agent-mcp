@@ -145,7 +145,7 @@ Then check everything at once:
 
 ```
 $ telegram-agent-mcp --doctor
-telegram-agent-mcp 0.4.0
+telegram-agent-mcp 0.4.1
 
 configuration
   source:   config file /home/you/.config/telegram-agent-mcp/agents.toml
