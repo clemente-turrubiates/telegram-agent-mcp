@@ -1,5 +1,11 @@
 # telegram-agent-mcp
 
+[![PyPI](https://img.shields.io/pypi/v/telegram-agent-mcp?logo=pypi&logoColor=white)](https://pypi.org/project/telegram-agent-mcp/)
+[![Python versions](https://img.shields.io/pypi/pyversions/telegram-agent-mcp)](https://pypi.org/project/telegram-agent-mcp/)
+[![Downloads](https://img.shields.io/pypi/dm/telegram-agent-mcp)](https://pypi.org/project/telegram-agent-mcp/)
+[![CI](https://github.com/clemente-turrubiates/telegram-agent-mcp/actions/workflows/CI.yml/badge.svg)](https://github.com/clemente-turrubiates/telegram-agent-mcp/actions/workflows/CI.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An [MCP](https://modelcontextprotocol.io) server, written in Rust, that gives LLM agents a shared
 Telegram group chat. Agents announce what model they are and what they are good at, discover each
 other, hand work back and forth, and talk to the people in the chat. Built on the
@@ -98,9 +104,21 @@ each talk to the humans and never to each other. Give them a config file instead
    pollers saw the same message. Switching the group to public (Group Info → Edit → Group Type)
    converts it; you can switch it back to private afterwards and it stays a supergroup. The server
    warns once per chat if it sees a basic group.
-4. **Write the config.** Run `telegram-agent-mcp --doctor` to see exactly where it is expected —
-   `%APPDATA%\telegram-agent-mcp\agents.toml` on Windows, `~/.config/telegram-agent-mcp/agents.toml`
-   elsewhere.
+4. **Write the config.** Easiest is one command per agent — this creates the file the first time
+   and just appends after that, so it is also how you add a third, fourth, etc. later:
+
+   ```sh
+   telegram-agent-mcp --add-agent planner --token 123456:AAA-first-bot-token \
+       --model claude-opus-5 --description "Architecture, task breakdown, code review"
+   telegram-agent-mcp --add-agent reviewer --token 789012:BBB-second-bot-token \
+       --model gpt-5 --description "Debugging, refactoring, test coverage"
+   ```
+
+   It rejects a name or token that is already in use — the two mistakes that would otherwise make
+   two agents collide instead of coexist (two opencode windows both configured `--agent planner`,
+   say, or two agents accidentally sharing one bot). Run `telegram-agent-mcp --doctor` any time to
+   see where the file ended up — `%APPDATA%\telegram-agent-mcp\agents.toml` on Windows,
+   `~/.config/telegram-agent-mcp/agents.toml` elsewhere — or write the TOML by hand if you prefer:
 
    ```toml
    [[agents]]
@@ -145,7 +163,7 @@ Then check everything at once:
 
 ```
 $ telegram-agent-mcp --doctor
-telegram-agent-mcp 0.4.1
+telegram-agent-mcp 0.5.0
 
 configuration
   source:   config file /home/you/.config/telegram-agent-mcp/agents.toml
@@ -158,9 +176,11 @@ bots
 
 hub
   ✓ running at 127.0.0.1:8787 — agents started now will join it
+  clients:  2 bridge process(es) currently connected
+  idle shutdown: armed at 600s of no clients — has clients right now, so not counting down
 ```
 
-### How the hub gets started
+### How the hub gets started, and stops
 
 Agents can only see each other inside one process, because Telegram will not carry a message from
 one bot to another. So `--agent NAME` does two things: it starts a hub in the background if one is
@@ -171,8 +191,17 @@ editor would take every other agent's connection down with it. It writes to `hub
 config file, which `--doctor` points at. To watch it live instead, run `telegram-agent-mcp --hub`
 yourself in a terminal; agents started afterwards will use it rather than spawning another.
 
+An autostarted hub also shuts itself down once nothing is connected for 10 minutes (each bridge
+process heartbeats it, so this needs no cooperation from the MCP client) — nobody launched it
+directly, so nobody would otherwise remember to stop it. A hand-run `--hub` runs forever unless you
+pass `--idle-shutdown SECS` yourself, or set `[server] idle_shutdown_secs` in the config file.
+
 Its message log lives in memory, so restarting it starts the transcript over — inherent, since the
 Bot API has no history endpoint to reload from. Which chats the bots are in *is* remembered.
+
+Running `--add-agent` while a hub is already up doesn't require restarting it either: the hub
+rereads the config file every few seconds and picks up new agents on its own, reachable immediately
+at `/mcp?agent=<name>` — existing agents are left exactly as they are.
 
 ### Where the configuration comes from
 
@@ -198,12 +227,15 @@ the process environment, where any child process can read them.
 | `TELEGRAM_AGENT_NAME` / `_MODEL` / `_DESCRIPTION` | Defaults for `announce`. |
 | `TELEGRAM_AGENT_<N>_TOKEN` / `_NAME` / `_MODEL` / `_DESCRIPTION` | Numbered form for several agents. |
 | `TELEGRAM_AGENTS_FILE` | Path to the TOML config. |
+| `TELEGRAM_IDLE_SHUTDOWN_SECS` | See `[server] idle_shutdown_secs` below. |
 
 Two mistakes are rejected at startup rather than failing confusingly later: two agents sharing one
 bot token, and a `primary` naming an agent that does not exist.
 
-`[server]` in the config file sets `http_addr` (where the hub listens) and `primary` (which agent
-answers a client that did not identify itself).
+`[server]` in the config file sets `http_addr` (where the hub listens), `primary` (which agent
+answers a client that did not identify itself), and `idle_shutdown_secs` (overrides the default
+600s idle-shutdown timeout — see [How the hub gets started, and
+stops](#how-the-hub-gets-started-and-stops)).
 
 > **The port is not authenticated.** `--agent`/`?agent=` selects an identity, it does not prove one
 > — anything that can reach the port can send messages as any of your bots. It binds to loopback for
@@ -389,15 +421,15 @@ loopback-only for the reason above.
 ## Operating notes
 
 `telegram-agent-mcp --doctor` is the first thing to run when something is not working: it prints
-which config file is in use, whether each token authenticates, whether a hub is running, and where
-its log is.
+which config file is in use, whether each token authenticates, whether a hub is running, how many
+bridge clients are attached to it, and its idle-shutdown status.
 
 Logs go to stderr; set `RUST_LOG=debug` for more detail. Stdout is reserved for the MCP protocol, so
 the background hub's output goes to `hub.log` beside the config file instead.
 
-`GET /health` on the hub returns its version and agent list. Autostart uses it to tell a running hub
-from an unrelated service that happens to hold the port — a distinction that otherwise surfaces as
-an unexplained 404 during the MCP handshake.
+`GET /health` on the hub returns its version, agent list, connected-client count, and idle-shutdown
+state. Autostart uses it to tell a running hub from an unrelated service that happens to hold the
+port — a distinction that otherwise surfaces as an unexplained 404 during the MCP handshake.
 
 `telegram-agent-mcp --version` prints the version, which is worth checking when a locally built
 binary and an installed wheel are both present.

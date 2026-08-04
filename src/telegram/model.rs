@@ -361,7 +361,6 @@ pub(crate) fn to_simple_message(msg: RawMessage) -> SimpleMessage {
 // Text helpers
 // ---------------------------------------------------------------------------
 
-/// Formats a Telegram unix timestamp as `YYYY-MM-DD HH:MM:SS` UTC.
 /// How long ago `unix_secs` was, as a two-or-three character age like `4m` or
 /// `2h`. An absolute UTC timestamp costs ~24 characters on every single line
 /// of a transcript and tells a model less than "how stale is this" does — the

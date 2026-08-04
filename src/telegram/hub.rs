@@ -133,7 +133,35 @@ pub struct Hub {
     /// agent's first tool call fails with nothing it can do about it.
     chat_cache: Mutex<Option<PathBuf>>,
     new_message: Notify,
+    /// client id (a bridge process's PID) -> when it last heartbeated. Used
+    /// only to decide whether the hub is idle enough to shut itself down; a
+    /// missing or stale entry has no other effect. See [`crate::autostart`]
+    /// for why the hub is willing to exit at all.
+    clients: Mutex<HashMap<u32, Instant>>,
+    /// What the idle-shutdown watcher (`main::idle_shutdown_watch`) currently
+    /// knows about itself. Purely for `--doctor` and `/health` to report —
+    /// nothing here drives the shutdown decision, which the watcher still
+    /// makes on its own from [`Hub::has_clients`]; this only mirrors it so
+    /// that decision is visible from outside the process making it.
+    idle_shutdown: Mutex<Option<IdleShutdownStatus>>,
 }
+
+/// A snapshot of the idle-shutdown watcher's own state, for reporting.
+#[derive(Debug, Clone, Copy)]
+pub struct IdleShutdownStatus {
+    /// The configured grace period.
+    pub after: Duration,
+    /// When the hub last had zero clients, continuously, if it does right
+    /// now. `None` means a client is currently connected.
+    pub idle_since: Option<Instant>,
+}
+
+/// How long without a heartbeat before a client is presumed gone — a crashed
+/// or force-killed bridge never calls the disconnect endpoint, so idleness
+/// must also be inferred from silence, not only from an explicit goodbye.
+/// Several multiples of the bridge's heartbeat interval, so one dropped
+/// request under load doesn't read as a disconnect.
+const CLIENT_STALE_AFTER: Duration = Duration::from_secs(60);
 
 /// Adds the viewer-relative and presentational fields a stored message does
 /// not carry: how old it is, whether it is yours, whether it was aimed at you,
@@ -218,7 +246,69 @@ impl Hub {
             listening: Mutex::new(HashMap::new()),
             chat_cache: Mutex::new(None),
             new_message: Notify::new(),
+            clients: Mutex::new(HashMap::new()),
+            idle_shutdown: Mutex::new(None),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Idle shutdown
+    // -----------------------------------------------------------------
+
+    /// Records that a bridge client is still around. Called on connect and
+    /// on every heartbeat after that.
+    pub fn client_heartbeat(&self, client_id: u32) {
+        lock(&self.clients).insert(client_id, Instant::now());
+    }
+
+    /// Forgets a client that said goodbye. Best-effort — a client that is
+    /// killed rather than closed never calls this, which is what
+    /// [`Hub::prune_stale_clients`] is for.
+    pub fn client_disconnected(&self, client_id: u32) {
+        lock(&self.clients).remove(&client_id);
+    }
+
+    /// Drops clients that have gone silent for longer than a crashed or
+    /// force-killed bridge would ever leave a real connection idle.
+    pub fn prune_stale_clients(&self) {
+        lock(&self.clients).retain(|_, seen| seen.elapsed() < CLIENT_STALE_AFTER);
+    }
+
+    /// Whether any bridge client is currently known to be around. `false`
+    /// does not necessarily mean *no MCP client is connected* — a hub can
+    /// also be talked to directly at `/mcp` by something that isn't this
+    /// project's own bridge — only that none of *this project's* bridges
+    /// are, which is the only signal available for idle shutdown.
+    pub fn has_clients(&self) -> bool {
+        !lock(&self.clients).is_empty()
+    }
+
+    /// How many bridge clients are currently known to be around. See
+    /// [`Hub::has_clients`] for the same caveat about what this can't see.
+    pub fn client_count(&self) -> usize {
+        lock(&self.clients).len()
+    }
+
+    /// Called once by the idle-shutdown watcher when it starts, so `--doctor`
+    /// and `/health` can report that idle shutdown is armed at all.
+    pub fn arm_idle_shutdown(&self, after: Duration) {
+        *lock(&self.idle_shutdown) = Some(IdleShutdownStatus {
+            after,
+            idle_since: None,
+        });
+    }
+
+    /// Called by the idle-shutdown watcher on every tick to keep the
+    /// reportable state in sync with what it is actually timing against.
+    pub fn note_idle_since(&self, idle_since: Option<Instant>) {
+        if let Some(status) = lock(&self.idle_shutdown).as_mut() {
+            status.idle_since = idle_since;
+        }
+    }
+
+    /// The idle-shutdown watcher's current state, if one is running at all.
+    pub fn idle_shutdown_status(&self) -> Option<IdleShutdownStatus> {
+        *lock(&self.idle_shutdown)
     }
 
     /// Registers `bot_id` as blocked in `wait_for_reply` until the guard drops.
@@ -1135,6 +1225,42 @@ mod tests {
         assert!(
             hub.list_known_agents().is_empty(),
             "only bots may announce an agent profile"
+        );
+    }
+
+    #[test]
+    fn a_heartbeating_client_keeps_the_hub_non_idle() {
+        let hub = hub();
+        assert!(!hub.has_clients());
+        hub.client_heartbeat(123);
+        assert!(hub.has_clients());
+    }
+
+    #[test]
+    fn a_disconnected_client_no_longer_counts() {
+        let hub = hub();
+        hub.client_heartbeat(123);
+        hub.client_disconnected(123);
+        assert!(!hub.has_clients());
+    }
+
+    #[test]
+    fn pruning_only_drops_clients_that_have_gone_stale() {
+        let hub = hub();
+        hub.client_heartbeat(123);
+        // A fresh heartbeat must survive a prune — this is what a crashed
+        // bridge relies on being distinguished from, not what an ordinary
+        // still-connected one should ever trip.
+        hub.prune_stale_clients();
+        assert!(hub.has_clients(), "a fresh heartbeat must not be pruned");
+
+        // Backdate it past the staleness window to simulate a bridge that
+        // stopped heartbeating without saying goodbye.
+        lock(&hub.clients).insert(123, Instant::now() - CLIENT_STALE_AFTER);
+        hub.prune_stale_clients();
+        assert!(
+            !hub.has_clients(),
+            "a heartbeat older than the staleness window must be pruned"
         );
     }
 }

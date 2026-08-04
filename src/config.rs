@@ -39,6 +39,10 @@ pub struct ServerConfig {
     pub primary: Option<AgentId>,
     /// Listen address from the config file, if any. A `--hub ADDR` flag wins.
     pub http_addr: Option<String>,
+    /// Idle-shutdown timeout from the config file, if any. A `--idle-shutdown
+    /// SECS` flag wins; this is for setting a preference once instead of
+    /// having to pass the flag on every invocation that might start the hub.
+    pub idle_shutdown_secs: Option<u64>,
 }
 
 impl ServerConfig {
@@ -131,6 +135,7 @@ struct FileConfig {
 struct FileServer {
     http_addr: Option<String>,
     primary: Option<String>,
+    idle_shutdown_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +178,7 @@ fn from_file(path: &PathBuf) -> Result<ServerConfig> {
         agents,
         primary,
         http_addr: parsed.server.http_addr,
+        idle_shutdown_secs: parsed.server.idle_shutdown_secs,
     })
 }
 
@@ -213,6 +219,9 @@ fn from_numbered_env() -> Option<ServerConfig> {
         agents,
         primary,
         http_addr: std::env::var("TELEGRAM_MCP_HTTP_ADDR").ok(),
+        idle_shutdown_secs: std::env::var("TELEGRAM_IDLE_SHUTDOWN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok()),
     })
 }
 
@@ -238,6 +247,9 @@ fn from_single_env() -> Option<ServerConfig> {
         }],
         primary: None,
         http_addr: std::env::var("TELEGRAM_MCP_HTTP_ADDR").ok(),
+        idle_shutdown_secs: std::env::var("TELEGRAM_IDLE_SHUTDOWN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok()),
     })
 }
 
@@ -376,6 +388,106 @@ fn no_config_help() -> String {
     )
 }
 
+/// Adds one agent to the config file, creating it if it does not exist yet,
+/// without disturbing anything else already there.
+///
+/// This exists because "several agents" otherwise means hand-writing TOML:
+/// getting the `[[agents]]` table syntax, the quoting, and where it goes
+/// relative to an existing `[server]` block all right is exactly the kind of
+/// setup step the single-agent path (paste one token into an env var) does
+/// not require — which makes it the actual barrier to two MCP clients (e.g.
+/// two opencode windows) getting their own bot identity instead of
+/// colliding on one. Appending a single well-formed block, with the
+/// validation `ServerConfig` already does, removes that barrier without
+/// requiring a TOML *writer* dependency: this only ever adds a block, never
+/// rewrites one, so plain string formatting is enough and nothing already in
+/// the file — including comments — is touched.
+pub fn add_agent(
+    explicit_path: Option<PathBuf>,
+    name: &str,
+    token: &str,
+    model: Option<&str>,
+    description: Option<&str>,
+) -> Result<PathBuf> {
+    let id = AgentId::parse(name)?;
+    let token = token.trim();
+    if !token.contains(':') || token.split(':').next().is_none_or(|n| n.is_empty()) {
+        bail!(
+            "{token:?} doesn't look like a Telegram bot token — it should look like \
+             123456:AA... (copy it from @BotFather)"
+        );
+    }
+
+    let path = explicit_file(explicit_path)
+        .or_else(default_config_path)
+        .unwrap_or_else(|| {
+            config_dir()
+                .map(|d| d.join("agents.toml"))
+                .unwrap_or_else(|| PathBuf::from("agents.toml"))
+        });
+
+    if path.is_file() {
+        let existing = from_file(&path)?;
+        if let Some(dup) = existing.find(&id) {
+            bail!(
+                "agent \"{id}\" is already in {} (token starting {}...). Remove it there first, \
+                 or pick a different name.",
+                path.display(),
+                dup.token.chars().take(7).collect::<String>()
+            );
+        }
+        if let Some(taken_by) = existing.agents.iter().find(|a| a.token == token) {
+            bail!(
+                "that token is already used by agent {:?} in {}. Telegram allows only one \
+                 poller per token — create a separate bot per agent via @BotFather instead of \
+                 reusing this one.",
+                taken_by.id.to_string(),
+                path.display()
+            );
+        }
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let mut block = format!(
+        "\n[[agents]]\nname = {:?}\ntoken = {:?}\n",
+        id.to_string(),
+        token
+    );
+    if let Some(m) = model {
+        block.push_str(&format!("model = {m:?}\n"));
+    }
+    if let Some(d) = description {
+        block.push_str(&format!("description = {d:?}\n"));
+    }
+
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .write_all(block.as_bytes())
+        .with_context(|| format!("writing to {}", path.display()))?;
+
+    // Catches a bug in the block built above now, as a clear error, rather
+    // than as a parse failure the next time any agent tries to start.
+    from_file(&path).with_context(|| {
+        format!(
+            "{} no longer parses after adding this agent — this is a bug in telegram-agent-mcp, \
+             please report it",
+            path.display()
+        )
+    })?;
+
+    Ok(path)
+}
+
 // ---------------------------------------------------------------------------
 // Command line
 // ---------------------------------------------------------------------------
@@ -386,7 +498,15 @@ pub enum Mode {
     /// behaviour.
     Stdio,
     /// HTTP MCP server with N agents and N pollers sharing one log.
-    Hub { addr: String },
+    Hub {
+        addr: String,
+        /// Exit once no bridge client has been seen for this long. `None`
+        /// (the default for a hand-run `--hub`) means run forever — set only
+        /// by [`crate::autostart`] for a hub it started on the caller's
+        /// behalf, since that one has no operator watching it who would
+        /// otherwise have to remember to stop it.
+        idle_shutdown_secs: Option<u64>,
+    },
     /// stdio MCP that forwards to a hub over HTTP, for clients that can only
     /// spawn a command.
     Bridge {
@@ -399,6 +519,14 @@ pub enum Mode {
     },
     /// Report what is configured and what works, then exit.
     Doctor,
+    /// Appends one agent to the config file and exits. The plug-and-play path
+    /// to a second (or third...) identity without hand-writing TOML.
+    AddAgent {
+        name: String,
+        token: String,
+        model: Option<String>,
+        description: Option<String>,
+    },
 }
 
 /// The hub endpoint assumed when `--agent` is used without `--connect`.
@@ -420,28 +548,50 @@ USAGE:
                                           one is not already running)
     telegram-agent-mcp                    run the only configured agent
     telegram-agent-mcp --doctor           check the setup and report
+    telegram-agent-mcp --add-agent NAME --token TOKEN
+                                          add another agent identity, e.g. so
+                                          two MCP clients don't collide on one
 
 SETUP:
-    1. Create a bot per agent with @BotFather and add them all to one group.
-    2. Put the tokens in agents.toml (see --doctor for the exact path):
+    One agent (one MCP client, one bot): paste the token into TELEGRAM_BOT_TOKEN
+    in that client's config and you're done.
 
-           [[agents]]
-           name = \"planner\"
-           token = \"123456:AA...\"
+    Two or more (e.g. two opencode windows, each its own identity): create a
+    bot per agent with @BotFather, add them all to one group, then run
 
-    3. Point each MCP client at:
+           telegram-agent-mcp --add-agent planner --token 123456:AA...
+           telegram-agent-mcp --add-agent reviewer --token 789012:BB...
+
+    once each (this writes agents.toml — see --doctor for the exact path),
+    and point each MCP client at:
 
            telegram-agent-mcp --agent planner
+           telegram-agent-mcp --agent reviewer
+
+    They will not clash: each name gets its own bot token, so the transcript
+    and other agents can tell them apart, and `wait_for_reply` won't mistake
+    one for the other's own messages.
 
 OPTIONS:
     --agent NAME      Which agent to run as. With more than one configured,
                       this starts (or joins) a shared hub so the agents can
                       see each other's messages.
+    --add-agent NAME --token TOKEN [--model M] [--description D]
+                      Appends this agent to the config file (creating it if
+                      needed) and exits. Rejects a name or token already in
+                      use, since either means two agents would collide.
     --doctor          Report the config file in use, the agents in it, whether
                       each token works, and whether a hub is running.
     --config PATH     TOML file listing agents. Also TELEGRAM_AGENTS_FILE.
     --hub [ADDR]      Run only the hub, in the foreground (default
-                      127.0.0.1:8787). Useful for watching its logs.
+                      127.0.0.1:8787). Useful for watching its logs. Runs
+                      forever unless --idle-shutdown is also given.
+    --idle-shutdown SECS
+                      Exit once no bridge client has been seen for SECS
+                      seconds. Set automatically on a hub this process
+                      autostarted on the caller's behalf; not set by default
+                      on a hand-run --hub, which is assumed to have an
+                      operator watching it.
     --connect URL     Bridge stdio to a hub at a specific URL, instead of the
                       default one.
     -h, --help        Show this message.
@@ -461,6 +611,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli> {
     let mut mode: Option<Mode> = None;
     let mut config_path = None;
     let mut agent = None;
+    let mut idle_shutdown_secs = None;
+    let mut add_agent_token = None;
+    let mut add_agent_model = None;
+    let mut add_agent_description = None;
 
     let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next() {
@@ -482,7 +636,18 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli> {
                 } else {
                     DEFAULT_HTTP_ADDR.to_string()
                 };
-                mode = Some(Mode::Hub { addr });
+                mode = Some(Mode::Hub {
+                    addr,
+                    idle_shutdown_secs: None,
+                });
+            }
+            "--idle-shutdown" => {
+                let raw = it
+                    .next()
+                    .context("--idle-shutdown needs a number of seconds")?;
+                idle_shutdown_secs = Some(raw.parse::<u64>().with_context(|| {
+                    format!("--idle-shutdown {raw:?} is not a number of seconds")
+                })?);
             }
             "--connect" => {
                 let url = it.next().context("--connect needs a URL")?;
@@ -494,6 +659,20 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli> {
             }
             "--doctor" | "--check" => mode = Some(Mode::Doctor),
             "--agent" => agent = Some(it.next().context("--agent needs a name")?),
+            "--add-agent" => {
+                let name = it.next().context("--add-agent needs a NAME")?;
+                mode = Some(Mode::AddAgent {
+                    name,
+                    token: String::new(),
+                    model: None,
+                    description: None,
+                });
+            }
+            "--token" => add_agent_token = Some(it.next().context("--token needs a value")?),
+            "--model" => add_agent_model = Some(it.next().context("--model needs a value")?),
+            "--description" => {
+                add_agent_description = Some(it.next().context("--description needs a value")?)
+            }
             "--config" => {
                 config_path = Some(PathBuf::from(it.next().context("--config needs a path")?))
             }
@@ -501,12 +680,28 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli> {
         }
     }
 
-    // `--agent` is parsed independently of order, so apply it at the end.
+    // `--agent` and `--idle-shutdown` are parsed independently of order, so
+    // apply them at the end.
     if let Some(Mode::Bridge { url, autostart, .. }) = mode.clone() {
         mode = Some(Mode::Bridge {
             url,
             agent: agent.clone(),
             autostart,
+        });
+    }
+    if let Some(Mode::Hub { addr, .. }) = mode.clone() {
+        mode = Some(Mode::Hub {
+            addr,
+            idle_shutdown_secs,
+        });
+    }
+    if let Some(Mode::AddAgent { name, .. }) = mode.clone() {
+        let token = add_agent_token.context("--add-agent also needs --token TOKEN")?;
+        mode = Some(Mode::AddAgent {
+            name,
+            token,
+            model: add_agent_model.clone(),
+            description: add_agent_description.clone(),
         });
     }
 
@@ -518,7 +713,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli> {
             agent: Some(name),
             autostart: true,
         },
-        (None, Ok(addr)) => Mode::Hub { addr },
+        (None, Ok(addr)) => Mode::Hub {
+            addr,
+            idle_shutdown_secs,
+        },
         (None, Err(_)) => Mode::Stdio,
     });
 
@@ -550,13 +748,15 @@ mod tests {
         assert_eq!(
             parse_args(args(&["--hub"])).unwrap().mode,
             Mode::Hub {
-                addr: DEFAULT_HTTP_ADDR.into()
+                addr: DEFAULT_HTTP_ADDR.into(),
+                idle_shutdown_secs: None,
             }
         );
         assert_eq!(
             parse_args(args(&["--hub", "0.0.0.0:9000"])).unwrap().mode,
             Mode::Hub {
-                addr: "0.0.0.0:9000".into()
+                addr: "0.0.0.0:9000".into(),
+                idle_shutdown_secs: None,
             }
         );
         // A following flag must not be eaten as the address.
@@ -564,10 +764,33 @@ mod tests {
         assert_eq!(
             cli.mode,
             Mode::Hub {
-                addr: DEFAULT_HTTP_ADDR.into()
+                addr: DEFAULT_HTTP_ADDR.into(),
+                idle_shutdown_secs: None,
             }
         );
         assert_eq!(cli.config_path, Some(PathBuf::from("a.toml")));
+    }
+
+    #[test]
+    fn idle_shutdown_applies_regardless_of_argument_order() {
+        assert_eq!(
+            parse_args(args(&["--hub", "--idle-shutdown", "300"]))
+                .unwrap()
+                .mode,
+            Mode::Hub {
+                addr: DEFAULT_HTTP_ADDR.into(),
+                idle_shutdown_secs: Some(300),
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["--idle-shutdown", "300", "--hub"]))
+                .unwrap()
+                .mode,
+            Mode::Hub {
+                addr: DEFAULT_HTTP_ADDR.into(),
+                idle_shutdown_secs: Some(300),
+            }
+        );
     }
 
     #[test]
@@ -632,6 +855,7 @@ mod tests {
                 .collect(),
             primary: primary.map(|p| AgentId::parse(p).unwrap()),
             http_addr: None,
+            idle_shutdown_secs: None,
         }
     }
 
@@ -734,5 +958,98 @@ token = "222:bbb"
         assert_eq!(c.http_addr.as_deref(), Some("127.0.0.1:9999"));
         assert_eq!(c.default_agent().unwrap().id.to_string(), "qwen");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A fresh temp path for one test, so parallel test threads never share a
+    /// file the way a fixed name like `agents.toml` would risk.
+    fn temp_config_path(test_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tam-add-agent-{test_name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agents.toml");
+        std::fs::remove_file(&path).ok();
+        path
+    }
+
+    #[test]
+    fn add_agent_creates_the_file_when_it_does_not_exist_yet() {
+        let path = temp_config_path("creates-file");
+        let got = add_agent(Some(path.clone()), "planner", "111:aaa", None, None).unwrap();
+        assert_eq!(got, path);
+
+        let c = from_file(&path).unwrap();
+        assert_eq!(c.agents.len(), 1);
+        assert_eq!(c.agents[0].id.to_string(), "planner");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn add_agent_appends_without_disturbing_what_was_already_there() {
+        let path = temp_config_path("appends");
+        std::fs::write(
+            &path,
+            "# a comment a human wrote\n[[agents]]\nname = \"planner\"\ntoken = \"111:aaa\"\n",
+        )
+        .unwrap();
+
+        add_agent(
+            Some(path.clone()),
+            "reviewer",
+            "222:bbb",
+            Some("gpt-5"),
+            Some("debugging"),
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# a comment a human wrote"), "{raw}");
+
+        let c = from_file(&path).unwrap();
+        assert_eq!(c.agents.len(), 2);
+        assert_eq!(c.agents[0].id.to_string(), "planner");
+        assert_eq!(c.agents[1].id.to_string(), "reviewer");
+        assert_eq!(c.agents[1].profile.model.as_deref(), Some("gpt-5"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn add_agent_rejects_a_name_already_in_use() {
+        let path = temp_config_path("dup-name");
+        add_agent(Some(path.clone()), "planner", "111:aaa", None, None).unwrap();
+
+        let err = add_agent(Some(path.clone()), "planner", "222:bbb", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already in"), "{err}");
+        // Must not have appended a second, colliding block.
+        assert_eq!(from_file(&path).unwrap().agents.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn add_agent_rejects_a_token_already_in_use() {
+        // Two agents on one token would fight over the same getUpdates
+        // poller — the same thing ServerConfig::validate catches at startup,
+        // caught here instead so it never gets written down.
+        let path = temp_config_path("dup-token");
+        add_agent(Some(path.clone()), "planner", "111:aaa", None, None).unwrap();
+
+        let err = add_agent(Some(path.clone()), "reviewer", "111:aaa", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already used by agent"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn add_agent_rejects_something_that_is_not_a_bot_token() {
+        let path = temp_config_path("bad-token");
+        let err = add_agent(Some(path.clone()), "planner", "not-a-token", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("doesn't look like a Telegram bot token"),
+            "{err}"
+        );
+        assert!(!path.exists(), "must not create the file on a rejected add");
     }
 }
